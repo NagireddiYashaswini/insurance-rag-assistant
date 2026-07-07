@@ -1,14 +1,21 @@
+import os
 
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
-
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
+
+# ----------------------------
+# Load ENV
+# ----------------------------
+
+load_dotenv()
 
 # ----------------------------
 # Database URL
 # ----------------------------
 
-DATABASE_URL = "mysql+pymysql://root:root123@localhost/insurance_rag"
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # ----------------------------
 # Engine
@@ -36,8 +43,6 @@ Base = declarative_base()
 
 # ----------------------------
 # Import Models
-# IMPORTANT:
-# Import AFTER Base creation
 # ----------------------------
 
 from app.models.user_model import User
@@ -52,4 +57,3 @@ Base.metadata.create_all(
 )
 
 print("Database Connected Successfully")
-
