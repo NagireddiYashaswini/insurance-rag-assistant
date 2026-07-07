@@ -66,6 +66,5 @@ What is covered under accidental insurance?
 ## Future Improvements
 
 * Multi-document support
-* PDF upload feature
 * Conversational memory
 * Multilingual support
