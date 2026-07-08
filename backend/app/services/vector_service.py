@@ -1,9 +1,7 @@
 
 import chromadb
 
-from langchain_community.embeddings import (
-    HuggingFaceEmbeddings
-)
+from fastembed import TextEmbedding
 
 from rank_bm25 import BM25Okapi
 
@@ -23,7 +21,7 @@ collection = client.get_or_create_collection(
 # Embedding Model
 # ----------------------------
 
-embedding_model = HuggingFaceEmbeddings(
+embedding_model = TextEmbedding(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
@@ -84,10 +82,13 @@ def store_chunks(chunks, filename):
     texts = [c["text"] for c in normalized]
 
     # Generate embeddings
+    # fastembed returns a generator of numpy arrays, one per input text.
+    # ChromaDB needs plain lists, so convert each vector with .tolist().
 
-    embeddings = embedding_model.embed_documents(
-        texts
-    )
+    embeddings = [
+        vector.tolist()
+        for vector in embedding_model.embed(texts)
+    ]
 
     ids = []
 
@@ -173,21 +174,27 @@ def _tokenize(text):
     return text.lower().split()
 
 
-
 def search_chunks(query, filename, n_results=3):
 
     """
     Hybrid search over a single document:
 
-    1. Vector similarity search
-    2. BM25 keyword ranking
-    3. Combined scoring
+    1. Vector similarity search pulls a wider pool of semantically
+       relevant candidates from ChromaDB.
+    2. BM25 keyword scoring is run over that same candidate pool.
+    3. Candidates are re-ranked by a weighted blend of the two scores,
+       which helps when the exact wording of the query (e.g. a defined
+       term like "surrender value") matters as much as its meaning.
     """
 
-    query_embedding = embedding_model.embed_query(
-        query
-    )
+    # fastembed's query_embed() is also a generator; pull out the single
+    # vector for this one query and convert it to a plain list.
+    query_embedding = next(
+        embedding_model.query_embed(query)
+    ).tolist()
 
+    # Pull a larger candidate pool than we ultimately need so BM25 has
+    # something to re-rank.
     candidate_pool = max(n_results * 4, 10)
 
     results = collection.query(
@@ -205,15 +212,17 @@ def search_chunks(query, filename, n_results=3):
     distances = results["distances"][0]
     ids = results["ids"][0]
 
-    # ----------------------------
-    # No Results
-    # ----------------------------
+    if not documents:
 
-    if len(documents) == 0:
-
+        # This is the situation that previously led to hallucinated
+        # answers: no chunks matched this exact filename. Usually this
+        # means the PDF hasn't been (re-)uploaded since the vector store
+        # was last rebuilt, or the filename doesn't match what was
+        # stored. Logging it here makes that immediately visible instead
+        # of silently handing an empty context to the LLM.
         print(
-            "No chunks found in ChromaDB for filename:",
-            filename
+            "No chunks found in ChromaDB for filename:", filename,
+            "- try re-uploading this PDF."
         )
 
         return {
@@ -223,117 +232,45 @@ def search_chunks(query, filename, n_results=3):
             "ids": []
         }
 
-    # ----------------------------
-    # BM25 Ranking
-    # ----------------------------
+    # ---- BM25 re-ranking over the candidate pool ----
 
-    tokenized_corpus = [
-        _tokenize(doc)
-        for doc in documents
-    ]
+    tokenized_corpus = [_tokenize(doc) for doc in documents]
 
     try:
-
         bm25 = BM25Okapi(tokenized_corpus)
-
-        bm25_scores = list(
-            bm25.get_scores(
-                _tokenize(query)
-            )
-        )
-
+        bm25_scores = bm25.get_scores(_tokenize(query))
     except Exception as e:
-
-        print(
-            "Warning: BM25 failed:",
-            e
-        )
-
+        print("Warning: BM25 scoring failed, falling back to vector-only ranking -", e)
         bm25_scores = [0.0] * len(documents)
 
-    # ----------------------------
-    # Normalize Scores
-    # ----------------------------
+    # Normalize each score type to [0, 1] so they can be blended fairly.
+    max_bm25 = max(bm25_scores) if bm25_scores and max(bm25_scores) > 0 else 1.0
 
-    if len(bm25_scores) > 0 and max(bm25_scores) > 0:
-
-        max_bm25 = max(bm25_scores)
-
-    else:
-
-        max_bm25 = 1.0
-
-    if len(distances) > 0 and max(distances) > 0:
-
-        max_distance = max(distances)
-
-    else:
-
-        max_distance = 1.0
-
-    # ----------------------------
-    # Combine Scores
-    # ----------------------------
+    # Chroma distances are "lower is better" (cosine distance); convert
+    # to a "higher is better" similarity in [0, 1] before blending.
+    max_distance = max(distances) if distances else 1.0
+    max_distance = max_distance if max_distance > 0 else 1.0
 
     combined = []
 
     for i in range(len(documents)):
 
-        vector_similarity = 1 - (
-            distances[i] / max_distance
-        )
+        vector_similarity = 1 - (distances[i] / max_distance)
+        keyword_score = bm25_scores[i] / max_bm25
 
-        keyword_score = (
-            bm25_scores[i] / max_bm25
-        )
+        # Weighted toward semantic similarity, with keyword match as a
+        # tie-breaker / boost for exact terminology.
+        final_score = (0.7 * vector_similarity) + (0.3 * keyword_score)
 
-        final_score = (
-            0.7 * vector_similarity
-        ) + (
-            0.3 * keyword_score
-        )
+        combined.append((final_score, i))
 
-        combined.append(
-            (final_score, i)
-        )
+    combined.sort(key=lambda x: x[0], reverse=True)
 
-    # ----------------------------
-    # Sort Results
-    # ----------------------------
-
-    combined.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    top_indices = [
-        i for _, i in combined[:n_results]
-    ]
-
-    # ----------------------------
-    # Return Results
-    # ----------------------------
+    top_indices = [i for _, i in combined[:n_results]]
 
     return {
-
-        "documents": [
-            documents[i]
-            for i in top_indices
-        ],
-
-        "metadatas": [
-            metadatas[i]
-            for i in top_indices
-        ],
-
-        "distances": [
-            distances[i]
-            for i in top_indices
-        ],
-
-        "ids": [
-            ids[i]
-            for i in top_indices
-        ]
+        "documents": [documents[i] for i in top_indices],
+        "metadatas": [metadatas[i] for i in top_indices],
+        "distances": [distances[i] for i in top_indices],
+        "ids": [ids[i] for i in top_indices]
     }
-
